@@ -1,23 +1,20 @@
 package ru.quipy.payments.logic
 
-import io.micrometer.core.instrument.MeterRegistry
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
+import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.util.*
-import java.util.concurrent.RejectedExecutionException
-import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 @Service
-class OrderPayer(
-    meterRegistry: MeterRegistry,
-) {
+class OrderPayer {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
@@ -29,36 +26,29 @@ class OrderPayer(
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    private val rejectedPaymentsCounter = meterRegistry.counter("payment.admission.rejected")
-
     private val paymentExecutor = ThreadPoolExecutor(
         16,
         16,
         0L,
         TimeUnit.MILLISECONDS,
-        SynchronousQueue(),
+        LinkedBlockingQueue(8_000),
         NamedThreadFactory("payment-submission-executor"),
-        ThreadPoolExecutor.AbortPolicy()
+        CallerBlockingRejectedExecutionHandler()
     )
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
-        try {
-            paymentExecutor.execute {
-                val createdEvent = paymentESService.create {
-                    it.create(
-                        paymentId,
-                        orderId,
-                        amount
-                    )
-                }
-                logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
-
-                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+        paymentExecutor.submit {
+            val createdEvent = paymentESService.create {
+                it.create(
+                    paymentId,
+                    orderId,
+                    amount
+                )
             }
-        } catch (exception: RejectedExecutionException) {
-            rejectedPaymentsCounter.increment()
-            throw exception
+            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+
+            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
         return createdAt
     }
