@@ -1,16 +1,20 @@
 package ru.quipy.common.utils
 
 import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class OngoingWindow(
     maxWinSize: Int
 ) {
-    private val window = Semaphore(maxWinSize)
+    private val window = Semaphore(maxWinSize, true)
 
     fun acquire() {
         window.acquire()
     }
+
+    fun tryAcquire(timeoutMillis: Long) =
+        timeoutMillis > 0 && window.tryAcquire(timeoutMillis, TimeUnit.MILLISECONDS)
 
     fun release() = window.release()
 
