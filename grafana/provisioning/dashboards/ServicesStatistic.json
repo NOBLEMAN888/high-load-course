@@ -1996,13 +1996,13 @@
                 "uid": "PBFA97CFB590B2093"
               },
               "editorMode": "code",
-              "expr": "sum(rate(payment_admission_rejected_total{service=~\"$service\"}[30s]))",
+              "expr": "sum(payment_admission_rejected_total{service=~\"$service\"})",
               "legendFormat": "rejected (429)",
               "range": true,
               "refId": "A"
             }
           ],
-          "title": "Rejected payments rate (429)",
+          "title": "Rejected payments total (429)",
           "type": "timeseries"
         },
         {
