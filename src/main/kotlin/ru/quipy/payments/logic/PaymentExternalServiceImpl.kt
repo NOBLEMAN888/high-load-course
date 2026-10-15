@@ -49,7 +49,7 @@ class PaymentExternalSystemAdapterImpl(
         var acquired = false
 
         try {
-            val remainingDeadline = deadline - (now() - paymentStartedAt)
+            val remainingDeadline = deadline - (now() - paymentStartedAt) - requestAverageProcessingTime.toMillis()
             acquired = ongoingWindow.tryAcquire(remainingDeadline)
             if (!acquired) {
                 paymentESService.update(paymentId) {
