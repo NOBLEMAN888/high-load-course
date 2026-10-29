@@ -1,16 +1,8 @@
 package ru.quipy.payments.logic
 
 import org.slf4j.LoggerFactory
-import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
-import ru.quipy.common.utils.NamedThreadFactory
-import ru.quipy.core.EventSourcingService
-import ru.quipy.payments.api.PaymentAggregate
-import java.time.Duration
 import java.util.*
-import java.util.concurrent.Executors
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
 
 
 @Service
@@ -19,6 +11,22 @@ class PaymentSystemImpl(
 ) : PaymentService {
     companion object {
         val logger = LoggerFactory.getLogger(PaymentSystemImpl::class.java)
+    }
+
+    override fun tryReserve(deadline: Long): Boolean {
+        val reserved = mutableListOf<PaymentExternalSystemAdapter>()
+        for (account in paymentAccounts) {
+            if (!account.tryReserve(deadline)) {
+                reserved.forEach { it.releaseReservation() }
+                return false
+            }
+            reserved += account
+        }
+        return true
+    }
+
+    override fun releaseReservation() {
+        paymentAccounts.forEach { it.releaseReservation() }
     }
 
     override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {

@@ -13,6 +13,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.atomic.AtomicInteger
 
 
 // Advice: always treat time as a Duration
@@ -28,6 +29,9 @@ class PaymentExternalSystemAdapterImpl(
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
+
+        // Processing time is not constant, so the completion estimate is inflated a bit
+        private const val ESTIMATE_SAFETY_FACTOR = 1.1
     }
 
     private val serviceName = properties.serviceName
@@ -44,23 +48,48 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        rateLimiter.tickBlocking()
+    private val throughputPerMs = minOf(
+        rateLimitPerSec / 1000.0,
+        parallelRequests.toDouble() / requestAverageProcessingTime.toMillis()
+    )
 
-        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+    private val inSystem = AtomicInteger()
 
-        val transactionId = UUID.randomUUID()
-
-        // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-        // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+    override fun tryReserve(deadline: Long): Boolean {
+        val position = inSystem.incrementAndGet()
+        val queueWaitMs = maxOf(0, position - parallelRequests) / throughputPerMs
+        val expectedCompletion = now() + (queueWaitMs + requestAverageProcessingTime.toMillis()) * ESTIMATE_SAFETY_FACTOR
+        if (expectedCompletion > deadline) {
+            inSystem.decrementAndGet()
+            return false
         }
+        return true
+    }
 
-        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+    override fun releaseReservation() {
+        inSystem.decrementAndGet()
+    }
+
+    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        val transactionId = UUID.randomUUID()
+        var acquired = false
 
         try {
-            ongoingWindow.acquire()
+            acquired = ongoingWindow.tryAcquire(deadline - now() - requestAverageProcessingTime.toMillis())
+            if (!acquired) {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Payment deadline exceeded.")
+                }
+                return
+            }
+            rateLimiter.tickBlocking()
+
+            logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+            paymentESService.update(paymentId) {
+                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            }
+
+            logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
@@ -101,7 +130,10 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         } finally {
-            ongoingWindow.release()
+            if (acquired) {
+                ongoingWindow.release()
+            }
+            releaseReservation()
         }
     }
 
