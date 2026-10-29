@@ -5,7 +5,19 @@ import java.util.*
 
 interface PaymentService {
     /**
-     * Submit payment request to some external service.
+     * Admission control: reserves a slot in the queue of every account if each of them is expected
+     * to finish the payment before [deadline] (absolute epoch millis).
+     * Returns false if any account can't make it in time - the caller should answer 429.
+     */
+    fun tryReserve(deadline: Long): Boolean
+
+    /**
+     * Releases reservations made by [tryReserve] when the payment won't be submitted.
+     */
+    fun releaseReservation()
+
+    /**
+     * Submit payment request to some external service. Requires a successful [tryReserve].
      */
     fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
 }
@@ -17,6 +29,17 @@ interface PaymentService {
 
  */
 interface PaymentExternalSystemAdapter {
+    /**
+     * Reserves a place in the account queue if the payment is expected to complete before [deadline].
+     * Every successful reservation must be followed by exactly one [performPaymentAsync] or [releaseReservation].
+     */
+    fun tryReserve(deadline: Long): Boolean
+
+    fun releaseReservation()
+
+    /**
+     * Performs the payment. Requires a reservation obtained via [tryReserve] and releases it on completion.
+     */
     fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
 
     fun name(): String

@@ -13,6 +13,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.atomic.AtomicInteger
 
 
 // Advice: always treat time as a Duration
@@ -28,6 +29,9 @@ class PaymentExternalSystemAdapterImpl(
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
+
+        // Processing time is not constant, so the completion estimate is inflated a bit
+        private const val ESTIMATE_SAFETY_FACTOR = 1.1
     }
 
     private val serviceName = properties.serviceName
@@ -44,13 +48,34 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
+    private val throughputPerMs = minOf(
+        rateLimitPerSec / 1000.0,
+        parallelRequests.toDouble() / requestAverageProcessingTime.toMillis()
+    )
+
+    private val inSystem = AtomicInteger()
+
+    override fun tryReserve(deadline: Long): Boolean {
+        val position = inSystem.incrementAndGet()
+        val queueWaitMs = maxOf(0, position - parallelRequests) / throughputPerMs
+        val expectedCompletion = now() + (queueWaitMs + requestAverageProcessingTime.toMillis()) * ESTIMATE_SAFETY_FACTOR
+        if (expectedCompletion > deadline) {
+            inSystem.decrementAndGet()
+            return false
+        }
+        return true
+    }
+
+    override fun releaseReservation() {
+        inSystem.decrementAndGet()
+    }
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val transactionId = UUID.randomUUID()
         var acquired = false
 
         try {
-            val remainingDeadline = deadline - (now() - paymentStartedAt) - requestAverageProcessingTime.toMillis()
-            acquired = ongoingWindow.tryAcquire(remainingDeadline)
+            acquired = ongoingWindow.tryAcquire(deadline - now() - requestAverageProcessingTime.toMillis())
             if (!acquired) {
                 paymentESService.update(paymentId) {
                     it.logProcessing(false, now(), transactionId, reason = "Payment deadline exceeded.")
@@ -108,6 +133,7 @@ class PaymentExternalSystemAdapterImpl(
             if (acquired) {
                 ongoingWindow.release()
             }
+            releaseReservation()
         }
     }
 
