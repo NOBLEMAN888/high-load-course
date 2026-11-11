@@ -26,8 +26,18 @@ internal class DeadlinePaymentQueue<T>(
     data class Dispatch<T>(val task: T, val id: Long, val expired: Boolean)
 
     @Synchronized
-    fun reserve(deadline: Long, processingMs: Long): Rejection? {
-        if (waiting >= capacity) return Rejection.CAPACITY
+    fun reserveByCapacity(limit: Int): Boolean {
+        if (waiting >= minOf(capacity, limit)) return false
+        waiting++
+        return true
+    }
+
+    @Synchronized
+    fun reserve(deadline: Long, processingMs: Long): Rejection? = reserve(deadline, processingMs, capacity)
+
+    @Synchronized
+    fun reserve(deadline: Long, processingMs: Long, maxWaiting: Int): Rejection? {
+        if (waiting >= minOf(capacity, maxWaiting)) return Rejection.CAPACITY
         val now = monotonicMillis()
         val slots = PriorityQueue<Long>()
         active.values.forEach { started ->
