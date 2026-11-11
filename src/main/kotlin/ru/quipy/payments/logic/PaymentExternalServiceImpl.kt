@@ -65,6 +65,11 @@ class PaymentExternalSystemAdapterImpl(
     private val queue = DeadlinePaymentQueue<PaymentTask>(rateLimitPerSec, parallelRequests)
     private val dispatcher = Executors.newSingleThreadScheduledExecutor(
         NamedThreadFactory("payment-dispatch-$accountName"))
+    private val submissionWorkers = Executors.newFixedThreadPool(
+        minOf(32, parallelRequests), NamedThreadFactory("payment-submit-$accountName"))
+    private val sendLock = Any()
+    private val sendIntervalNanos = (1_000_000_000L + rateLimitPerSec - 1) / rateLimitPerSec + 1_000_000L
+    private var nextSendNanos = System.nanoTime()
 
     private val client = OkHttpClient.Builder()
         .dispatcher(Dispatcher().apply {
@@ -139,6 +144,16 @@ class PaymentExternalSystemAdapterImpl(
 
     private fun dispatchNext() {
         val dispatch = queue.poll(completionBudgetMs()) ?: return
+        try {
+            submissionWorkers.execute { submit(dispatch) }
+            if (!dispatch.expired) queue.dispatched()
+        } catch (e: Exception) {
+            if (!dispatch.expired) queue.complete(dispatch.id)
+            throw e
+        }
+    }
+
+    private fun submit(dispatch: DeadlinePaymentQueue.Dispatch<PaymentTask>) {
         val task = dispatch.task
         var handedOff = false
         try {
@@ -161,8 +176,8 @@ class PaymentExternalSystemAdapterImpl(
                 .build()
             val call = client.newCall(request)
             call.timeout().timeout(maxOf(1, task.deadline - now()), TimeUnit.MILLISECONDS)
-            val sentAt = now()
-            call.enqueue(object : Callback {
+            var sentAt = 0L
+            val callback = object : Callback {
                 override fun onResponse(call: Call, response: Response) {
                     try {
                         // Fast rate-limit errors must not lower the processing-time estimate.
@@ -182,16 +197,24 @@ class PaymentExternalSystemAdapterImpl(
                         queue.complete(dispatch.id)
                     }
                 }
-            })
-            handedOff = true
-            sent.increment()
+            }
+            synchronized(sendLock) {
+                val remaining = nextSendNanos - System.nanoTime()
+                if (remaining > 0) TimeUnit.NANOSECONDS.sleep(remaining)
+                if (task.deadline - now() < completionBudgetMs()) {
+                    expire(task)
+                    return
+                }
+                sentAt = now()
+                call.enqueue(callback)
+                handedOff = true
+                nextSendNanos = System.nanoTime() + sendIntervalNanos
+                sent.increment()
+            }
         } catch (e: Exception) {
             handleFailure(e, task.transactionId, task.paymentId)
         } finally {
-            if (!dispatch.expired) {
-                queue.dispatched()
-                if (!handedOff) queue.complete(dispatch.id)
-            }
+            if (!dispatch.expired && !handedOff) queue.complete(dispatch.id)
         }
     }
 
@@ -204,6 +227,7 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun close() {
         dispatcher.shutdown()
+        submissionWorkers.shutdown()
         client.dispatcher.cancelAll()
         client.dispatcher.executorService.shutdown()
         client.connectionPool.evictAll()
