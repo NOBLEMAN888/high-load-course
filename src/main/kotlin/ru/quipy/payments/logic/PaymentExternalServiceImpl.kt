@@ -2,6 +2,7 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Timer
 import okhttp3.Call
@@ -13,9 +14,7 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.Response
 import org.slf4j.LoggerFactory
-import ru.quipy.common.utils.OngoingWindow
-import ru.quipy.common.utils.SlidingWindowRateLimiter
-import ru.quipy.common.utils.TokenBucketRateLimiter
+import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.IOException
@@ -23,7 +22,7 @@ import java.io.InterruptedIOException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.Executors
 
 
 // Advice: always treat time as a Duration
@@ -55,38 +54,31 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val rateLimiter = SlidingWindowRateLimiter(
-        rateLimitPerSec.toLong(),
-        Duration.ofSeconds(1))
-
-    private val admissionLimiter = TokenBucketRateLimiter(
-        rateLimitPerSec,
-        rateLimitPerSec * 10,
-        1,
-        TimeUnit.SECONDS,
+    private data class PaymentTask(
+        val paymentId: UUID,
+        val amount: Int,
+        val startedAt: Long,
+        val deadline: Long,
+        val transactionId: UUID = UUID.randomUUID(),
     )
 
-    private val ongoingWindow = OngoingWindow(parallelRequests)
-
-    private val effectiveParallel = maxOf(
-        1,
-        minOf(parallelRequests.toLong(), rateLimitPerSec.toLong() * requestAverageProcessingTime.toMillis() / 1000).toInt()
-    )
+    private val queue = DeadlinePaymentQueue<PaymentTask>(rateLimitPerSec, parallelRequests)
+    private val dispatcher = Executors.newSingleThreadScheduledExecutor(
+        NamedThreadFactory("payment-dispatch-$accountName"))
 
     private val client = OkHttpClient.Builder()
         .dispatcher(Dispatcher().apply {
             maxRequests = parallelRequests
             maxRequestsPerHost = parallelRequests
         })
-        .connectionPool(ConnectionPool(effectiveParallel * 2, 5, TimeUnit.MINUTES))
+        .connectionPool(ConnectionPool(parallelRequests, 5, TimeUnit.MINUTES))
         .build()
 
-    private val throughputPerMs = minOf(
-        rateLimitPerSec / 1000.0,
-        parallelRequests.toDouble() / requestAverageProcessingTime.toMillis()
-    )
-
-    private val inSystem = AtomicInteger()
+    private val rejectedByCapacity = meterRegistry.counter("payment.queue.rejected", "account", accountName, "reason", "capacity")
+    private val rejectedByDeadline = meterRegistry.counter("payment.queue.rejected", "account", accountName, "reason", "deadline")
+    private val expiredInQueue = meterRegistry.counter("payment.queue.expired", "account", accountName)
+    private val sent = meterRegistry.counter("payment.provider.sent", "account", accountName)
+    private val queueWait = Timer.builder("payment.queue.wait").tag("account", accountName).register(meterRegistry)
 
     private val providerLatency = Timer.builder("payment.provider.duration")
         .tag("account", accountName)
@@ -112,97 +104,109 @@ class PaymentExternalSystemAdapterImpl(
         return processingEstimateMs
     }
 
+    init {
+        Gauge.builder("payment.queue.size", queue) { it.waitingCount().toDouble() }
+            .tag("account", accountName).register(meterRegistry)
+        Gauge.builder("payment.provider.active", queue) { it.activeCount().toDouble() }
+            .tag("account", accountName).register(meterRegistry)
+        dispatcher.scheduleWithFixedDelay({
+            try {
+                dispatchNext()
+            } catch (e: Exception) {
+                logger.error("[$accountName] Payment dispatch failed", e)
+            }
+        }, 0, 2, TimeUnit.MILLISECONDS)
+    }
+
+    private fun completionBudgetMs() =
+        (processingEstimateMs() * ESTIMATE_SAFETY_FACTOR).toLong().coerceAtLeast(1)
+
     override fun tryReserve(deadline: Long): Boolean {
-        val position = inSystem.incrementAndGet()
-        val queueWaitMs = maxOf(0, position - effectiveParallel) / throughputPerMs
-        val expectedCompletion = now() + (queueWaitMs + processingEstimateMs()) * ESTIMATE_SAFETY_FACTOR
-        if (expectedCompletion > deadline || !admissionLimiter.tick()) {
-            inSystem.decrementAndGet()
-            return false
+        val rejection = queue.reserve(deadline, completionBudgetMs())
+        when (rejection) {
+            DeadlinePaymentQueue.Rejection.CAPACITY -> rejectedByCapacity.increment()
+            DeadlinePaymentQueue.Rejection.DEADLINE -> rejectedByDeadline.increment()
+            null -> return true
         }
-        return true
+        return false
     }
 
-    override fun releaseReservation() {
-        inSystem.decrementAndGet()
-    }
-
-    private fun waitBudget(deadline: Long) = deadline - now() - processingEstimateMs()
+    override fun releaseReservation() = queue.releaseReservation()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        val transactionId = UUID.randomUUID()
-        var acquired = false
+        queue.enqueue(PaymentTask(paymentId, amount, paymentStartedAt, deadline), deadline)
+    }
+
+    private fun dispatchNext() {
+        val dispatch = queue.poll(completionBudgetMs()) ?: return
+        val task = dispatch.task
         var handedOff = false
-
         try {
-            acquired = ongoingWindow.tryAcquire(waitBudget(deadline))
-            if (!acquired) {
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Payment deadline exceeded.")
-                }
+            queueWait.record(maxOf(0, now() - task.startedAt), TimeUnit.MILLISECONDS)
+            paymentESService.update(task.paymentId) {
+                it.logSubmission(!dispatch.expired, task.transactionId, now(), Duration.ofMillis(now() - task.startedAt))
+            }
+            if (dispatch.expired) {
+                expire(task)
                 return
             }
-
-            logger.warn("[$accountName] Submitting payment request for payment $paymentId")
-            paymentESService.update(paymentId) {
-                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-            }
-
-            val request = Request.Builder().run {
-                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                post(emptyBody)
-            }.build()
-
-            if (!rateLimiter.tickBlocking(waitBudget(deadline))) {
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Payment deadline exceeded.")
-                }
+            // Persistence above can take time. Recheck immediately before the HTTP call.
+            if (task.deadline - now() < completionBudgetMs()) {
+                expire(task)
                 return
             }
-
-            logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
-
+            val request = Request.Builder()
+                .url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=${task.transactionId}&paymentId=${task.paymentId}&amount=${task.amount}")
+                .post(emptyBody)
+                .build()
             val call = client.newCall(request)
-            call.timeout().timeout(maxOf(1, deadline - now()), TimeUnit.MILLISECONDS)
+            call.timeout().timeout(maxOf(1, task.deadline - now()), TimeUnit.MILLISECONDS)
             val sentAt = now()
-
             call.enqueue(object : Callback {
                 override fun onResponse(call: Call, response: Response) {
-                    providerLatency.record(now() - sentAt, TimeUnit.MILLISECONDS)
                     try {
-                        response.use { handleResponse(it, transactionId, paymentId) }
+                        // Fast rate-limit errors must not lower the processing-time estimate.
+                        if (response.isSuccessful) providerLatency.record(now() - sentAt, TimeUnit.MILLISECONDS)
+                        response.use { handleResponse(it, task.transactionId, task.paymentId) }
                     } catch (e: Exception) {
-                        handleFailure(e, transactionId, paymentId)
+                        handleFailure(e, task.transactionId, task.paymentId)
                     } finally {
-                        complete()
+                        queue.complete(dispatch.id)
                     }
                 }
 
                 override fun onFailure(call: Call, e: IOException) {
-                    providerLatency.record(now() - sentAt, TimeUnit.MILLISECONDS)
                     try {
-                        handleFailure(e, transactionId, paymentId)
+                        handleFailure(e, task.transactionId, task.paymentId)
                     } finally {
-                        complete()
+                        queue.complete(dispatch.id)
                     }
                 }
             })
             handedOff = true
+            sent.increment()
         } catch (e: Exception) {
-            handleFailure(e, transactionId, paymentId)
+            handleFailure(e, task.transactionId, task.paymentId)
         } finally {
-            if (!handedOff) {
-                if (acquired) {
-                    ongoingWindow.release()
-                }
-                releaseReservation()
+            if (!dispatch.expired) {
+                queue.dispatched()
+                if (!handedOff) queue.complete(dispatch.id)
             }
         }
     }
 
-    private fun complete() {
-        ongoingWindow.release()
-        releaseReservation()
+    private fun expire(task: PaymentTask) {
+        expiredInQueue.increment()
+        paymentESService.update(task.paymentId) {
+            it.logProcessing(false, now(), task.transactionId, reason = "Payment deadline exceeded before dispatch.")
+        }
+    }
+
+    override fun close() {
+        dispatcher.shutdown()
+        client.dispatcher.cancelAll()
+        client.dispatcher.executorService.shutdown()
+        client.connectionPool.evictAll()
     }
 
     private fun handleResponse(response: Response, transactionId: UUID, paymentId: UUID) {
