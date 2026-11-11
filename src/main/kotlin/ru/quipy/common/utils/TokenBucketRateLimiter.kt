@@ -2,7 +2,6 @@ package ru.quipy.common.utils
 
 import java.util.concurrent.TimeUnit
 
-/** Allows a bounded burst and replenishes permits continuously using monotonic time. */
 class TokenBucketRateLimiter(
     rate: Int,
     bucketMaxCapacity: Int,

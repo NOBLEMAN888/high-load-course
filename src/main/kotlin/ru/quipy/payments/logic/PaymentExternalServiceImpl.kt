@@ -59,8 +59,6 @@ class PaymentExternalSystemAdapterImpl(
         rateLimitPerSec.toLong(),
         Duration.ofSeconds(1))
 
-    // Buffer short input peaks; the deadline check below still bounds accepted work.
-    // This is admission control, not a replacement for the provider's strict RPS limit.
     private val admissionLimiter = TokenBucketRateLimiter(
         rateLimitPerSec,
         rateLimitPerSec * 10,
