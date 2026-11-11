@@ -15,6 +15,7 @@ import okhttp3.Response
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
+import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.IOException
@@ -57,6 +58,15 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(
         rateLimitPerSec.toLong(),
         Duration.ofSeconds(1))
+
+    // Buffer short input peaks; the deadline check below still bounds accepted work.
+    // This is admission control, not a replacement for the provider's strict RPS limit.
+    private val admissionLimiter = TokenBucketRateLimiter(
+        rateLimitPerSec,
+        rateLimitPerSec * 10,
+        1,
+        TimeUnit.SECONDS,
+    )
 
     private val ongoingWindow = OngoingWindow(parallelRequests)
 
@@ -108,7 +118,7 @@ class PaymentExternalSystemAdapterImpl(
         val position = inSystem.incrementAndGet()
         val queueWaitMs = maxOf(0, position - effectiveParallel) / throughputPerMs
         val expectedCompletion = now() + (queueWaitMs + processingEstimateMs()) * ESTIMATE_SAFETY_FACTOR
-        if (expectedCompletion > deadline) {
+        if (expectedCompletion > deadline || !admissionLimiter.tick()) {
             inSystem.decrementAndGet()
             return false
         }
