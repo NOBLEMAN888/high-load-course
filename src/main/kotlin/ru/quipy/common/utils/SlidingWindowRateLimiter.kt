@@ -37,6 +37,12 @@ class SlidingWindowRateLimiter(
         }
     }
 
+    fun nextPermitDelayMillis(): Long {
+        if (sum.get() < rate) return 0
+        val oldest = queue.peek() ?: return 0
+        return (oldest.timestamp + window.toMillis() - System.currentTimeMillis()).coerceAtLeast(1)
+    }
+
     fun tickBlocking(timeoutMillis: Long): Boolean {
         if (timeoutMillis <= 0) return false
         val waitUntil = System.currentTimeMillis() + timeoutMillis

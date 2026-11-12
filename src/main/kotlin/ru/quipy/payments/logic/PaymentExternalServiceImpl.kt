@@ -46,6 +46,7 @@ class PaymentExternalSystemAdapterImpl(
         private const val MIN_LATENCY_SAMPLES = 50
         private const val COLD_START_LATENCY_FACTOR = 1.5
         private const val LATENCY_ESTIMATE_REFRESH_MS = 200
+        private const val RATE_WINDOW_MARGIN_MS = 20L
     }
 
     private val serviceName = properties.serviceName
@@ -54,9 +55,10 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
+    private val rateWindow = Duration.ofMillis(1_000 + RATE_WINDOW_MARGIN_MS)
     private val rateLimiter = SlidingWindowRateLimiter(
         rateLimitPerSec.toLong(),
-        Duration.ofSeconds(1))
+        rateWindow)
 
     private val ongoingWindow = OngoingWindow(parallelRequests)
     private val rateWaiters = ReentrantLock(true)
@@ -73,11 +75,6 @@ class PaymentExternalSystemAdapterImpl(
         })
         .connectionPool(ConnectionPool(effectiveParallel * 2, 5, TimeUnit.MINUTES))
         .build()
-
-    private val throughputPerMs = minOf(
-        rateLimitPerSec / 1000.0,
-        parallelRequests.toDouble() / requestAverageProcessingTime.toMillis()
-    )
 
     private val inSystem = AtomicInteger()
 
@@ -107,8 +104,16 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun tryReserve(deadline: Long): Boolean {
         val position = inSystem.incrementAndGet()
-        val queueWaitMs = maxOf(0, position - effectiveParallel) / throughputPerMs
-        val expectedCompletion = now() + (queueWaitMs + processingEstimateMs()) * ESTIMATE_SAFETY_FACTOR
+        val processingMs = processingEstimateMs().coerceAtLeast(1)
+        val throughputPerMs = minOf(
+            rateLimitPerSec.toDouble() / rateWindow.toMillis(),
+            parallelRequests.toDouble() / processingMs
+        )
+        val queueWaitMs = maxOf(
+            maxOf(0, position - effectiveParallel) / throughputPerMs,
+            rateLimiter.nextPermitDelayMillis().toDouble()
+        )
+        val expectedCompletion = now() + (queueWaitMs + processingMs) * ESTIMATE_SAFETY_FACTOR
         if (expectedCompletion > deadline) {
             inSystem.decrementAndGet()
             return false
