@@ -4,7 +4,6 @@ import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.http.HttpStatus
-import org.springframework.http.HttpHeaders
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 import ru.quipy.orders.repository.OrderRepository
@@ -61,7 +60,6 @@ class APIController {
     @ExceptionHandler(RejectedExecutionException::class)
     fun paymentRejected(): ResponseEntity<Void> = ResponseEntity
         .status(HttpStatus.TOO_MANY_REQUESTS)
-        .header(HttpHeaders.RETRY_AFTER, "1")
         .build()
 
     @PostMapping("/orders/{orderId}/payment")
