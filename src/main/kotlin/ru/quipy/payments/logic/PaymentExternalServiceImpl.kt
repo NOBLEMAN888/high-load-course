@@ -187,7 +187,6 @@ class PaymentExternalSystemAdapterImpl(
                 .post(emptyBody)
                 .build()
             val call = client.newCall(request)
-            call.timeout().timeout(maxOf(1, task.deadline - now()), TimeUnit.MILLISECONDS)
             var sentAt = 0L
             val callback = object : Callback {
                 override fun onResponse(call: Call, response: Response) {
@@ -217,6 +216,7 @@ class PaymentExternalSystemAdapterImpl(
                     return
                 }
                 sentAt = now()
+                call.timeout().timeout(maxOf(1, task.deadline - sentAt), TimeUnit.MILLISECONDS)
                 call.enqueue(callback)
                 handedOff = true
                 nextSendNanos = System.nanoTime() + sendIntervalNanos
