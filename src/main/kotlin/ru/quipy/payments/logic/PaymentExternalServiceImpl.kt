@@ -15,7 +15,6 @@ import okhttp3.RequestBody
 import okhttp3.Response
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.NamedThreadFactory
-import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.IOException
@@ -60,7 +59,6 @@ class PaymentExternalSystemAdapterImpl(
     )
 
     private val queue = DeadlinePaymentQueue<PaymentTask>(rateLimitPerSec, parallelRequests)
-    private val shortDeadlineLimiter = TokenBucketRateLimiter(rateLimitPerSec, rateLimitPerSec, 1, TimeUnit.SECONDS)
     private val dispatcher = Executors.newSingleThreadScheduledExecutor(
         NamedThreadFactory("payment-dispatch-$accountName"))
     private val submissionWorkers = Executors.newFixedThreadPool(
@@ -71,15 +69,14 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder()
         .dispatcher(Dispatcher().apply {
-            maxRequests = parallelRequests * 2
-            maxRequestsPerHost = parallelRequests * 2
+            maxRequests = parallelRequests
+            maxRequestsPerHost = parallelRequests
         })
         .connectionPool(ConnectionPool(parallelRequests, 5, TimeUnit.MINUTES))
         .build()
 
     private val rejectedByCapacity = meterRegistry.counter("payment.queue.rejected", "account", accountName, "reason", "capacity")
     private val rejectedByDeadline = meterRegistry.counter("payment.queue.rejected", "account", accountName, "reason", "deadline")
-    private val rejectedByRate = meterRegistry.counter("payment.queue.rejected", "account", accountName, "reason", "rate")
     private val expiredInQueue = meterRegistry.counter("payment.queue.expired", "account", accountName)
     private val sent = meterRegistry.counter("payment.provider.sent", "account", accountName)
     private val queueWait = Timer.builder("payment.queue.wait").tag("account", accountName).register(meterRegistry)
@@ -138,11 +135,6 @@ class PaymentExternalSystemAdapterImpl(
                 else rejectedByDeadline.increment()
                 return false
             }
-            if (!shortDeadlineLimiter.tick()) {
-                queue.releaseReservation()
-                rejectedByRate.increment()
-                return false
-            }
             return true
         }
         val maxWaiting = ((remaining - averageMs * 2) * rateLimitPerSec / 1_000).toInt()
@@ -199,18 +191,22 @@ class PaymentExternalSystemAdapterImpl(
             var sentAt = 0L
             val callback = object : Callback {
                 override fun onResponse(call: Call, response: Response) {
-                    queue.complete(dispatch.id)
                     try {
                         if (response.isSuccessful) providerLatency.record(now() - sentAt, TimeUnit.MILLISECONDS)
                         response.use { handleResponse(it, task.transactionId, task.paymentId) }
                     } catch (e: Exception) {
                         handleFailure(e, task.transactionId, task.paymentId)
+                    } finally {
+                        queue.complete(dispatch.id)
                     }
                 }
 
                 override fun onFailure(call: Call, e: IOException) {
-                    queue.complete(dispatch.id)
-                    handleFailure(e, task.transactionId, task.paymentId)
+                    try {
+                        handleFailure(e, task.transactionId, task.paymentId)
+                    } finally {
+                        queue.complete(dispatch.id)
+                    }
                 }
             }
             synchronized(sendLock) {
