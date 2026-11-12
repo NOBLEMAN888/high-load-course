@@ -60,7 +60,7 @@ class PaymentExternalSystemAdapterImpl(
     )
 
     private val queue = DeadlinePaymentQueue<PaymentTask>(rateLimitPerSec, parallelRequests)
-    private val shortDeadlineLimiter = TokenBucketRateLimiter(rateLimitPerSec, rateLimitPerSec, 1, TimeUnit.SECONDS)
+    private val shortDeadlineLimiter = TokenBucketRateLimiter(rateLimitPerSec, rateLimitPerSec * 2, 1, TimeUnit.SECONDS)
     private val dispatcher = Executors.newSingleThreadScheduledExecutor(
         NamedThreadFactory("payment-dispatch-$accountName"))
     private val submissionWorkers = Executors.newFixedThreadPool(
@@ -132,7 +132,7 @@ class PaymentExternalSystemAdapterImpl(
             return false
         }
         if (remaining <= averageMs * 3) {
-            val rejection = queue.reserve(deadline, completionBudgetMs(), rateLimitPerSec)
+            val rejection = queue.reserve(deadline, completionBudgetMs(), rateLimitPerSec * 2)
             if (rejection != null) {
                 if (rejection == DeadlinePaymentQueue.Rejection.CAPACITY) rejectedByCapacity.increment()
                 else rejectedByDeadline.increment()
