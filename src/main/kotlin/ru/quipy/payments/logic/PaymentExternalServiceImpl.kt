@@ -77,6 +77,7 @@ class PaymentExternalSystemAdapterImpl(
         .build()
 
     private val inSystem = AtomicInteger()
+    private val rateGranted = AtomicInteger()
 
     private val providerLatency = Timer.builder("payment.provider.duration")
         .tag("account", accountName)
@@ -111,7 +112,7 @@ class PaymentExternalSystemAdapterImpl(
         )
         val queueWaitMs = maxOf(
             maxOf(0, position - effectiveParallel) / throughputPerMs,
-            rateLimiter.nextPermitDelayMillis().toDouble()
+            rateLimiter.estimatedDelayMillis(maxOf(1, position - rateGranted.get())).toDouble()
         )
         val expectedCompletion = now() + (queueWaitMs + processingMs) * ESTIMATE_SAFETY_FACTOR
         if (expectedCompletion > deadline) {
@@ -140,6 +141,7 @@ class PaymentExternalSystemAdapterImpl(
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val transactionId = UUID.randomUUID()
         var acquired = false
+        var granted = false
         var handedOff = false
 
         try {
@@ -167,6 +169,8 @@ class PaymentExternalSystemAdapterImpl(
                 }
                 return
             }
+            rateGranted.incrementAndGet()
+            granted = true
 
             logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
@@ -200,6 +204,7 @@ class PaymentExternalSystemAdapterImpl(
             handleFailure(e, transactionId, paymentId)
         } finally {
             if (!handedOff) {
+                if (granted) rateGranted.decrementAndGet()
                 if (acquired) {
                     ongoingWindow.release()
                 }
@@ -215,6 +220,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun complete() {
+        rateGranted.decrementAndGet()
         ongoingWindow.release()
         releaseReservation()
     }
