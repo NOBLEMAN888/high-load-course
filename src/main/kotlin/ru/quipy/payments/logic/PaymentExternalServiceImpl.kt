@@ -50,6 +50,7 @@ class PaymentExternalSystemAdapterImpl(
         private const val COLD_START_LATENCY_FACTOR = 1.5
         private const val LATENCY_ESTIMATE_REFRESH_MS = 200
         private const val RATE_WINDOW_MARGIN_MS = 20L
+        private const val MAX_RETRIES = 2
     }
 
     private val serviceName = properties.serviceName
@@ -151,7 +152,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        performPaymentAttempt(paymentId, amount, paymentStartedAt, deadline, UUID.randomUUID(), true)
+        performPaymentAttempt(paymentId, amount, paymentStartedAt, deadline, UUID.randomUUID(), MAX_RETRIES)
     }
 
     private fun performPaymentAttempt(
@@ -160,7 +161,7 @@ class PaymentExternalSystemAdapterImpl(
         paymentStartedAt: Long,
         deadline: Long,
         transactionId: UUID,
-        retryAllowed: Boolean,
+        retriesRemaining: Int,
     ) {
         var acquired = false
         var granted = false
@@ -207,11 +208,11 @@ class PaymentExternalSystemAdapterImpl(
                     var retryScheduled = false
                     try {
                         val body = response.use { readResponse(it, transactionId, paymentId) }
-                        if (!body.result && response.isSuccessful && retryAllowed && waitBudget(deadline) > 0) {
+                        if (!body.result && response.isSuccessful && retriesRemaining > 0 && waitBudget(deadline) > 0) {
                             releaseAttempt()
                             attemptReleased = true
                             retryExecutor.execute {
-                                performPaymentAttempt(paymentId, amount, paymentStartedAt, deadline, transactionId, false)
+                                performPaymentAttempt(paymentId, amount, paymentStartedAt, deadline, transactionId, retriesRemaining - 1)
                             }
                             retryScheduled = true
                         } else {
