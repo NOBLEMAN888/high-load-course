@@ -50,7 +50,7 @@ class PaymentExternalSystemAdapterImpl(
         private const val COLD_START_LATENCY_FACTOR = 1.5
         private const val LATENCY_ESTIMATE_REFRESH_MS = 200
         private const val RATE_WINDOW_MARGIN_MS = 20L
-        private const val MAX_RETRIES = 2
+        private const val MAX_RETRIES = 4
     }
 
     private val serviceName = properties.serviceName
