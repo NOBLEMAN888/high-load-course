@@ -60,7 +60,7 @@ class PaymentExternalSystemAdapterImpl(
     )
 
     private val queue = DeadlinePaymentQueue<PaymentTask>(rateLimitPerSec, parallelRequests)
-    private val shortDeadlineLimiter = TokenBucketRateLimiter(rateLimitPerSec, rateLimitPerSec * 2, 1, TimeUnit.SECONDS)
+    private val shortDeadlineLimiter = TokenBucketRateLimiter(rateLimitPerSec, rateLimitPerSec, 1, TimeUnit.SECONDS)
     private val dispatcher = Executors.newSingleThreadScheduledExecutor(
         NamedThreadFactory("payment-dispatch-$accountName"))
     private val submissionWorkers = Executors.newFixedThreadPool(
@@ -71,8 +71,8 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder()
         .dispatcher(Dispatcher().apply {
-            maxRequests = parallelRequests
-            maxRequestsPerHost = parallelRequests
+            maxRequests = parallelRequests * 2
+            maxRequestsPerHost = parallelRequests * 2
         })
         .connectionPool(ConnectionPool(parallelRequests, 5, TimeUnit.MINUTES))
         .build()
@@ -132,7 +132,7 @@ class PaymentExternalSystemAdapterImpl(
             return false
         }
         if (remaining <= averageMs * 3) {
-            val rejection = queue.reserve(deadline, completionBudgetMs(), rateLimitPerSec * 2)
+            val rejection = queue.reserve(deadline, completionBudgetMs(), rateLimitPerSec)
             if (rejection != null) {
                 if (rejection == DeadlinePaymentQueue.Rejection.CAPACITY) rejectedByCapacity.increment()
                 else rejectedByDeadline.increment()
@@ -199,22 +199,18 @@ class PaymentExternalSystemAdapterImpl(
             var sentAt = 0L
             val callback = object : Callback {
                 override fun onResponse(call: Call, response: Response) {
+                    queue.complete(dispatch.id)
                     try {
                         if (response.isSuccessful) providerLatency.record(now() - sentAt, TimeUnit.MILLISECONDS)
                         response.use { handleResponse(it, task.transactionId, task.paymentId) }
                     } catch (e: Exception) {
                         handleFailure(e, task.transactionId, task.paymentId)
-                    } finally {
-                        queue.complete(dispatch.id)
                     }
                 }
 
                 override fun onFailure(call: Call, e: IOException) {
-                    try {
-                        handleFailure(e, task.transactionId, task.paymentId)
-                    } finally {
-                        queue.complete(dispatch.id)
-                    }
+                    queue.complete(dispatch.id)
+                    handleFailure(e, task.transactionId, task.paymentId)
                 }
             }
             synchronized(sendLock) {
